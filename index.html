@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Animated Gradient — WebGL/GLSL</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #050a1a; overflow: hidden; }
+  #gl { display: block; width: 100vw; height: 100vh; }
+  /* demo-only overlays, remove for production */
+  .label {
+    position: fixed; left: 32px; bottom: 28px; z-index: 2;
+    font: 600 14px/1.4 -apple-system, system-ui, sans-serif;
+    color: rgba(255,255,255,.82); letter-spacing: .04em;
+    text-shadow: 0 1px 12px rgba(0,0,0,.5); pointer-events: none;
+  }
+  .label small { display:block; font-weight: 400; opacity:.6; margin-top:4px }
+  .fps {
+    position: fixed; right: 18px; top: 16px; z-index: 2;
+    font: 600 12px/1.5 ui-monospace, Menlo, monospace;
+    color: rgba(255,255,255,.9); text-align: right; white-space: pre;
+    text-shadow: 0 1px 10px rgba(0,0,0,.6); pointer-events: none;
+  }
+  .repo {
+    position: fixed; right: 18px; bottom: 22px; z-index: 3;
+    font: 600 13px/1 -apple-system, system-ui, sans-serif;
+    color: rgba(255,255,255,.92); text-decoration: none;
+    padding: 10px 15px; border-radius: 999px;
+    background: rgba(255,255,255,.10); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,.20);
+    text-shadow: 0 1px 8px rgba(0,0,0,.5); transition: background .2s;
+  }
+  .repo:hover { background: rgba(255,255,255,.22); }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div class="label">Animated gradient · WebGL/GLSL<small>domain-warped fbm · move the cursor</small></div>
+<div id="fps" class="fps"></div>
+<a class="repo" href="https://github.com/AxGord/webgl-gradient" target="_blank" rel="noopener">★ Source on GitHub</a>
+
+<!-- vertex: full-screen triangle -->
+<script id="vert" type="x-shader/x-vertex">
+attribute vec2 a_pos;
+void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }
+</script>
+
+<!-- fragment: domain-warped fbm, 3-zone palette -->
+<script id="frag" type="x-shader/x-fragment">
+precision highp float;
+
+uniform vec2  u_res;
+uniform float u_time;
+uniform vec2  u_mouse;   // 0..1, eased
+
+// distinct color zones from the brief
+const vec3 NAVY   = vec3(0.020, 0.063, 0.180);  // deep navy
+const vec3 CORAL  = vec3(1.000, 0.451, 0.247);  // coral / orange
+const vec3 PINK   = vec3(0.886, 0.318, 0.733);  // pink
+const vec3 PURPLE = vec3(0.451, 0.235, 0.741);  // purple
+
+// cheap polynomial hash (Dave Hoskins) — no sin(), stable on mobile highp
+vec2 hash2(vec2 p){
+  vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+  p3 += dot(p3, p3.yzx + 33.33);
+  return -1.0 + 2.0 * fract((p3.xx + p3.yz) * p3.zy);
+}
+
+float noise(vec2 p){
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(dot(hash2(i + vec2(0.0,0.0)), f - vec2(0.0,0.0)),
+                 dot(hash2(i + vec2(1.0,0.0)), f - vec2(1.0,0.0)), u.x),
+             mix(dot(hash2(i + vec2(0.0,1.0)), f - vec2(0.0,1.0)),
+                 dot(hash2(i + vec2(1.0,1.0)), f - vec2(1.0,1.0)), u.x), u.y);
+}
+
+const mat2 ROT = mat2(1.6, 1.2, -1.2, 1.6);  // rotate + ~2x scale per octave
+
+// octaves are per-call: warp layers (q, r) only displace coordinates, so they
+// need just low-frequency structure — their high octaves get smoothed away by
+// the warp itself. Full detail lives only in the final lookup.
+float fbm(vec2 p, const int oct){
+  float v = 0.0, a = 0.55;
+  for (int i = 0; i < 5; i++){
+    if (i >= oct) break;
+    v += a * noise(p);
+    p = ROT * p;
+    a *= 0.5;
+  }
+  return v;
+}
+
+// vec2-valued gradient noise: both channels share ONE lattice + corner hashes,
+// so a 2D warp costs ~half the hashing of two independent scalar fbm calls.
+vec4 hash42(vec2 p){
+  vec4 p4 = fract(vec4(p.xyxy) * vec4(0.1031, 0.1030, 0.0973, 0.1099));
+  p4 += dot(p4, p4.wzxy + 33.33);
+  return fract((p4.xxyz + p4.yzzw) * p4.zywx);
+}
+
+vec2 noise2(vec2 p){
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  vec4 h00 = -1.0 + 2.0 * hash42(i + vec2(0.0, 0.0));
+  vec4 h10 = -1.0 + 2.0 * hash42(i + vec2(1.0, 0.0));
+  vec4 h01 = -1.0 + 2.0 * hash42(i + vec2(0.0, 1.0));
+  vec4 h11 = -1.0 + 2.0 * hash42(i + vec2(1.0, 1.0));
+  // .xy gradients drive channel A, .zw drive channel B — decorrelated, free
+  float a = mix(mix(dot(h00.xy, f - vec2(0.0,0.0)), dot(h10.xy, f - vec2(1.0,0.0)), u.x),
+                mix(dot(h01.xy, f - vec2(0.0,1.0)), dot(h11.xy, f - vec2(1.0,1.0)), u.x), u.y);
+  float b = mix(mix(dot(h00.zw, f - vec2(0.0,0.0)), dot(h10.zw, f - vec2(1.0,0.0)), u.x),
+                mix(dot(h01.zw, f - vec2(0.0,1.0)), dot(h11.zw, f - vec2(1.0,1.0)), u.x), u.y);
+  return vec2(a, b);
+}
+
+vec2 fbm2(vec2 p, const int oct){
+  vec2 v = vec2(0.0);
+  float a = 0.55;
+  for (int i = 0; i < 5; i++){
+    if (i >= oct) break;
+    v += a * noise2(p);
+    p = ROT * p;
+    a *= 0.5;
+  }
+  return v;
+}
+
+void main(){
+  // aspect-correct UV, centered
+  vec2 uv = (gl_FragCoord.xy - 0.5 * u_res) / u_res.y;
+
+  float t = u_time * 0.06;
+  vec2 mouse = (u_mouse - 0.5) * 0.6;
+
+  // --- domain warping (fbm of fbm) for organic, painterly flow ---
+  vec2 q = fbm2(uv * 1.6 + vec2(0.0, t), 2);
+
+  vec2 r = fbm2(uv * 1.6 + 3.5 * q + vec2(1.7, 9.2) + mouse + t * 1.4, 3);
+
+  float f = fbm(uv * 1.6 + 3.0 * r, 5);
+
+  // --- map the warped field onto the palette ---
+  vec3 col = NAVY;
+  col = mix(col, PURPLE, smoothstep(-0.1, 0.6, f));
+  col = mix(col, PINK,   smoothstep(0.05, 0.85, length(q)));
+  col = mix(col, CORAL,  smoothstep(0.35, 1.05, r.x + 0.4 * f));
+
+  // lift the highlights where the field folds, deepen the troughs
+  col *= 0.78 + 0.55 * smoothstep(-0.2, 0.9, f);
+
+  // soft vignette to keep it premium / hero-like
+  vec2 vp = gl_FragCoord.xy / u_res;
+  float vig = smoothstep(1.15, 0.25, length(vp - 0.5));
+  col *= mix(0.82, 1.0, vig);
+
+  // subtle filmic-ish tone + tiny dither to avoid banding
+  col = pow(col, vec3(0.92));
+  float dither = (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233))) * 43758.5453) - 0.5) / 255.0;
+  col += dither;
+
+  gl_FragColor = vec4(col, 1.0);
+}
+</script>
+
+<script>
+(function () {
+  var canvas = document.getElementById('gl');
+  var fpsEl = document.getElementById('fps');
+  var gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+  if (!gl) { canvas.style.background = 'linear-gradient(135deg,#0a1428,#c8519b,#ff7340)'; return; }
+
+  function compile(type, src) {
+    var s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s);
+    return s;
+  }
+  var prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER,   document.getElementById('vert').textContent));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, document.getElementById('frag').textContent));
+  gl.linkProgram(prog);
+  gl.useProgram(prog);
+
+  // full-screen triangle
+  var buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  var loc = gl.getAttribLocation(prog, 'a_pos');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+  var uRes   = gl.getUniformLocation(prog, 'u_res');
+  var uTime  = gl.getUniformLocation(prog, 'u_time');
+  var uMouse = gl.getUniformLocation(prog, 'u_mouse');
+
+  var mouse = [0.5, 0.5], target = [0.5, 0.5];
+  window.addEventListener('pointermove', function (e) {
+    target[0] = e.clientX / window.innerWidth;
+    target[1] = 1.0 - e.clientY / window.innerHeight;
+  });
+
+  function resize() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width  = Math.floor(window.innerWidth  * dpr);
+    canvas.height = Math.floor(window.innerHeight * dpr);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  var start = performance.now();
+  var prev = start, lastReport = start;
+  var samples = [];                       // recent frame times (ms)
+
+  function report() {
+    if (samples.length < 8) return;
+    var s = samples.slice().sort(function (a, b) { return a - b; });
+    var p50 = s[(s.length * 0.5) | 0];
+    var p99 = s[(s.length * 0.99) | 0];   // worst-case frames
+    fpsEl.textContent =
+      Math.round(1000 / p50) + ' fps   ' + p50.toFixed(1) + ' ms\n' +
+      '1% low  ' + Math.round(1000 / p99) + ' fps\n' +
+      canvas.width + '×' + canvas.height + '  dpr ' + Math.min(window.devicePixelRatio || 1, 2).toFixed(1);
+  }
+
+  function frame(now) {
+    var dt = now - prev; prev = now;
+    if (dt > 0 && dt < 1000) {            // ignore tab-switch / first-frame spikes
+      samples.push(dt);
+      if (samples.length > 180) samples.shift();
+    }
+    if (now - lastReport > 300) { report(); lastReport = now; }
+
+    mouse[0] += (target[0] - mouse[0]) * 0.05;   // eased cursor follow
+    mouse[1] += (target[1] - mouse[1]) * 0.05;
+    gl.uniform2f(uRes, canvas.width, canvas.height);
+    gl.uniform1f(uTime, (now - start) / 1000);
+    gl.uniform2f(uMouse, mouse[0], mouse[1]);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
